@@ -89,6 +89,23 @@ javascriptRuntime.onMessage('someChannelName', (dynamic args) {
 });
 ```
 
+## Runtime limits
+
+The runtime factory accepts optional execution limits for native platforms:
+
+```dart
+final runtime = getJavascriptRuntime(
+  stackSize: 1024 * 1024,
+  timeout: 5000,
+  memoryLimit: 32 * 1024 * 1024,
+  gcThreshold: 4 * 1024 * 1024,
+);
+```
+
+`timeout` is the maximum synchronous JavaScript evaluation time in
+milliseconds. These limits are not available in the browser runtime and are
+ignored by the Web implementation.
+
 
 Now, if your javascript code calls `sendMessage('someChannelName', JSON.stringify([1,2,3]);` the above dart function provided as the second argument will be called
 with a List containing 1, 2, 3 as it elements.
