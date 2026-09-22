@@ -295,7 +295,11 @@ void jsFreeRuntime(
       ref.destroy();
     }
   }
-  _jsFreeRuntime(rt);
+  try {
+    _jsFreeRuntime(rt);
+  } finally {
+    runtimeOpaques.remove(rt);
+  }
   if (referenceleak.length > 0) {
     throw ('reference leak:\n    ADDR\tREF\tTYPE\tPROP\n' +
         referenceleak.join('\n'));

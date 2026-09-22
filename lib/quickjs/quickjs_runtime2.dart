@@ -144,11 +144,11 @@ class QuickJsRuntime2 extends JavascriptRuntime {
   close() {
     final rt = _rt;
     final ctx = _ctx;
+    if (rt == null) return;
+    _drainPendingJobs();
     _rt = null;
     _ctx = null;
     if (ctx != null) jsFreeContext(ctx);
-    if (rt == null) return;
-    _executePendingJob();
     try {
       jsFreeRuntime(rt);
     } on String catch (e) {
@@ -156,24 +156,26 @@ class QuickJsRuntime2 extends JavascriptRuntime {
     }
   }
 
-  void _executePendingJob() {
+  int _executeOnePendingJob() {
     final rt = _rt;
     final ctx = _ctx;
-    if (rt == null || ctx == null) return;
-    while (true) {
-      int err = jsExecutePendingJob(rt);
-      if (err <= 0) {
-        if (err < 0) print(_parseJSException(ctx));
-        break;
-      }
+    if (rt == null || ctx == null) return 0;
+    final result = jsExecutePendingJob(rt);
+    if (result < 0) {
+      print(_parseJSException(ctx));
+    }
+    return result;
+  }
+
+  void _drainPendingJobs() {
+    while (_executeOnePendingJob() > 0) {
+      // Keep running queued Promise jobs until QuickJS reports none left.
     }
   }
 
   /// Dispatch JavaScript Event loop.
   Future<void> dispatch() async {
-    //await for (final _ in port) {
-    _executePendingJob();
-    //}
+    _drainPendingJobs();
   }
 
   @override
@@ -277,8 +279,7 @@ class QuickJsRuntime2 extends JavascriptRuntime {
 
   @override
   int executePendingJob() {
-    this.dispatch();
-    return 0;
+    return _executeOnePendingJob();
   }
 
   @override
