@@ -250,6 +250,19 @@ final void Function(
             )>>('jsSetMemoryLimit')
     .asFunction();
 
+/// void jsSetGCThreshold(JSRuntime *rt, size_t threshold)
+final void Function(
+  Pointer<JSRuntime>,
+  int,
+) jsSetGCThreshold = _qjsLib
+    .lookup<
+        NativeFunction<
+            Void Function(
+              Pointer<JSRuntime>,
+              IntPtr,
+            )>>('jsSetGCThreshold')
+    .asFunction();
+
 /// void jsFreeRuntime(JSRuntime *rt)
 final void Function(
   Pointer<JSRuntime>,

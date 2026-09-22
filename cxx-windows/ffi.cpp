@@ -149,6 +149,11 @@ extern "C"
     JS_SetMemoryLimit(rt, limit);
   }
 
+  DLLEXPORT void jsSetGCThreshold(JSRuntime *rt, size_t threshold)
+  {
+    JS_SetGCThreshold(rt, threshold);
+  }
+
   DLLEXPORT void jsFreeRuntime(JSRuntime *rt)
   {
     RuntimeOpaque *opauqe = (RuntimeOpaque *)JS_GetRuntimeOpaque(rt);

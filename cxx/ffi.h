@@ -37,6 +37,8 @@ extern "C"
 
   DLLEXPORT void jsSetMemoryLimit(JSRuntime *rt, size_t limit);
 
+  DLLEXPORT void jsSetGCThreshold(JSRuntime *rt, size_t threshold);
+
   DLLEXPORT void jsFreeRuntime(JSRuntime *rt);
 
   DLLEXPORT JSValue *jsNewCFunction(JSContext *ctx, JSValue *funcData);

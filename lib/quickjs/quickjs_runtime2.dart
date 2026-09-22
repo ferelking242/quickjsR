@@ -38,6 +38,9 @@ class QuickJsRuntime2 extends JavascriptRuntime {
   /// Max memory for quickjs.
   final int? memoryLimit;
 
+  /// Garbage collection threshold in bytes. Zero keeps QuickJS's default.
+  final int? gcThreshold;
+
   /// Message Port for event loop. Close it to stop dispatching event loop.
   ReceivePort port = ReceivePort();
 
@@ -52,6 +55,7 @@ class QuickJsRuntime2 extends JavascriptRuntime {
     this.stackSize = 1024 * 1024,
     this.timeout,
     this.memoryLimit,
+    this.gcThreshold,
     this.hostPromiseRejectionHandler,
   }) {
     this.init();
@@ -130,6 +134,8 @@ class QuickJsRuntime2 extends JavascriptRuntime {
     if (stackSize > 0) jsSetMaxStackSize(rt, stackSize);
     final memoryLimit = this.memoryLimit ?? 0;
     if (memoryLimit > 0) jsSetMemoryLimit(rt, memoryLimit);
+    final gcThreshold = this.gcThreshold ?? 0;
+    if (gcThreshold > 0) jsSetGCThreshold(rt, gcThreshold);
     _rt = rt;
     _ctx = jsNewContext(rt);
   }
