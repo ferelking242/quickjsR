@@ -206,12 +206,20 @@ Pointer<JSValue> channelDispacher(
 
   final runtimeOpaque = runtimeOpaques[rt];
 
-  assert(
-    runtimeOpaque != null,
-    'The requested runtime opaque does not exist: $rt',
-  );
+  // A callback can still arrive after the runtime was released (a pending
+  // promise job, a finalizer during teardown). Throwing here would unwind out
+  // of an FFI callback — which aborts the process — so answer with `undefined`
+  // and let the engine finish unwinding instead.
+  if (runtimeOpaque == null) return jsUNDEFINED();
 
-  return runtimeOpaque!._channel(ctx, type, argv);
+  try {
+    return runtimeOpaque._channel(ctx, type, argv);
+  } catch (_) {
+    // The Dart handler must never throw back into QuickJS: an exception that
+    // crosses the FFI boundary aborts the process. A failed channel call is
+    // reported to JS as `undefined`.
+    return jsUNDEFINED();
+  }
 }
 
 Pointer<JSRuntime> jsNewRuntime(
