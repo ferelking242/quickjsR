@@ -78,6 +78,10 @@ abstract class JavascriptRuntime {
 
   void dispose();
 
+  /// True once the underlying engine has been released. Background pollers
+  /// (promise settlement, timers) must check this before touching the runtime.
+  bool get isClosed => false;
+
   static Map<String, Map<String, Function(dynamic arg)>>
       _channelFunctionsRegistered = {};
 

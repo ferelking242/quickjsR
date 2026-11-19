@@ -105,6 +105,10 @@ extension HandlePromises on JavascriptRuntime {
       var completed = false;
       Function? fnEvaluatePromise;
       fnEvaluatePromise = () async {
+        // The runtime may be gone (source disposed, worker replaced) while a
+        // JS promise is still pending: evaluating into a freed context is a
+        // native use-after-free, not a Dart exception.
+        if (isClosed || completed) return;
         this.executePendingJob();
         if (!completed) {
           await Future.delayed(
@@ -138,6 +142,18 @@ extension HandlePromises on JavascriptRuntime {
         callFunction(evalRegisterPromise, value.rawResult).stringResult;
     int idxPromise = int.parse(promiseQuerableIdx);
     Timer.periodic(Duration(milliseconds: 20), (timer) {
+      // Same use-after-free as above: this timer outlives the runtime it polls
+      // when the source is disposed mid-request, and `evaluate` would then run
+      // JS against freed native memory (SIGSEGV inside js_channel/jsEval).
+      if (isClosed) {
+        timer.cancel();
+        if (!completer.isCompleted) {
+          completer.completeError(
+            JsEvalResult('Runtime closed', null, isError: true),
+          );
+        }
+        return;
+      }
       // call to _JS_ExecutePendingJob
       this.executePendingJob();
       //eval(REGISTER_PROMISE_FUNCTION);

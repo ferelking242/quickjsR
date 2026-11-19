@@ -314,6 +314,21 @@ void jsFreeRuntime(
   }
 }
 
+/// Destroys every JS reference still held for [rt] and forgets the runtime.
+///
+/// Must run *while the context is still alive*: each `JSRef.destroy()` calls
+/// `jsFreeValue(ctx, …)`, so freeing the context first made teardown read and
+/// write freed native memory. The caller frees the context afterwards.
+void jsReleaseRuntimeRefs(Pointer<JSRuntime> rt) {
+  final opaque = runtimeOpaques[rt];
+  if (opaque == null) return;
+  for (final ref in List<JSRef>.from(opaque._ref)) {
+    ref.destroy();
+    runtimeOpaques[rt]?._ref.remove(ref);
+  }
+  opaque._ref.clear();
+}
+
 /// JSValue *jsNewCFunction(JSContext *ctx, JSValue *funcData)
 final Pointer<JSValue> Function(
   Pointer<JSContext> ctx,

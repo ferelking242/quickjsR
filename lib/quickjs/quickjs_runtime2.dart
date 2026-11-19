@@ -29,6 +29,13 @@ class QuickJsRuntime2 extends JavascriptRuntime {
   Pointer<JSRuntime>? _rt;
   Pointer<JSContext>? _ctx;
 
+  /// Set by [dispose]. A disposed runtime is terminal: [_ensureEngine] must
+  /// never silently create a second engine for a caller that still holds this
+  /// object (a pending promise poller, a late extension call). Re-creating one
+  /// left the old JSRefs and channel callbacks pointing at freed memory, which
+  /// is the SIGSEGV seen in `js_channel`.
+  bool _disposed = false;
+
   /// Max stack size for quickjs.
   int stackSize;
 
@@ -63,6 +70,9 @@ class QuickJsRuntime2 extends JavascriptRuntime {
 
   _ensureEngine() {
     if (_rt != null) return;
+    if (_disposed) {
+      throw JSError('InternalError: JavaScript runtime has been disposed');
+    }
     final rt = jsNewRuntime((ctx, type, ptr) {
       try {
         switch (type) {
@@ -140,14 +150,20 @@ class QuickJsRuntime2 extends JavascriptRuntime {
     _ctx = jsNewContext(rt);
   }
 
-  /// Free Runtime and Context which can be recreate when evaluate again.
+  /// Free Runtime and Context which can recreate when evaluate again.
   close() {
     final rt = _rt;
     final ctx = _ctx;
     if (rt == null) return;
     _drainPendingJobs();
+    // Mark closed before touching anything native, so a poller that wakes up
+    // during teardown stops instead of evaluating into a dying engine.
     _rt = null;
     _ctx = null;
+    // JS refs are released *first*: each destroy() frees a JSValue through the
+    // still-live context. Doing it after jsFreeContext freed the context first
+    // and turned teardown into a use-after-free.
+    jsReleaseRuntimeRefs(rt);
     if (ctx != null) jsFreeContext(ctx);
     try {
       jsFreeRuntime(rt);
@@ -155,6 +171,11 @@ class QuickJsRuntime2 extends JavascriptRuntime {
       throw JSError(e);
     }
   }
+
+  /// True once [close] released the engine. Anything still holding a timer or
+  /// a callback into this runtime (promise polling, a late JS call) must stop
+  /// instead of evaluating against freed native memory.
+  bool get isClosed => _rt == null || _disposed;
 
   int _executeOnePendingJob() {
     final rt = _rt;
@@ -264,6 +285,7 @@ class QuickJsRuntime2 extends JavascriptRuntime {
 
   @override
   void dispose() {
+    _disposed = true;
     try {
       port.close(); // stop dispatch loop
       close(); // close engine
