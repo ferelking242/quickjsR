@@ -68,6 +68,12 @@ extern "C"
 
   JSValue js_channel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *func_data)
   {
+    // `ctx` itself can arrive null: the crash log for this frame is
+    // `SIGSEGV / fault addr 0x0` with x0 == 0, and x0 is `ctx`. JS_GetRuntime
+    // dereferences it immediately, so the check has to come first — the
+    // opaque/alive guard below can never run otherwise.
+    if (ctx == nullptr)
+      return JS_UNDEFINED;
     JSRuntime *rt = JS_GetRuntime(ctx);
     RuntimeOpaque *opaque = (RuntimeOpaque *)JS_GetRuntimeOpaque(rt);
     // A released runtime has no opaque (or a dead one): return undefined

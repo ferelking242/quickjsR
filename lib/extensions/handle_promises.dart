@@ -93,7 +93,20 @@ extension HandlePromises on JavascriptRuntime {
     final completer = Completer<JsEvalResult>();
 
     if (timeout != null) {
-      return _doHandlePromise(value, completer).timeout(timeout);
+      // `Future.timeout` only abandons the outer future: the inner completer
+      // stays pending and its poll timer keeps evaluating JS on a runtime the
+      // caller has already walked away from. Complete it so the poll stops.
+      return _doHandlePromise(value, completer).timeout(
+        timeout,
+        onTimeout: () {
+          if (!completer.isCompleted) {
+            completer.completeError(
+              JsEvalResult('Promise timed out', null, isError: true),
+            );
+          }
+          throw TimeoutException('Promise timed out', timeout);
+        },
+      );
     } else {
       return _doHandlePromise(value, completer);
     }
@@ -141,17 +154,31 @@ extension HandlePromises on JavascriptRuntime {
     final promiseQuerableIdx =
         callFunction(evalRegisterPromise, value.rawResult).stringResult;
     int idxPromise = int.parse(promiseQuerableIdx);
-    Timer.periodic(Duration(milliseconds: 20), (timer) {
+    Timer? pollTimer;
+    void stopPolling() {
+      pollTimer?.cancel();
+      pollTimer = null;
+    }
+
+    pollTimer = Timer.periodic(Duration(milliseconds: 20), (timer) {
       // Same use-after-free as above: this timer outlives the runtime it polls
       // when the source is disposed mid-request, and `evaluate` would then run
       // JS against freed native memory (SIGSEGV inside js_channel/jsEval).
       if (isClosed) {
-        timer.cancel();
+        stopPolling();
         if (!completer.isCompleted) {
           completer.completeError(
             JsEvalResult('Runtime closed', null, isError: true),
           );
         }
+        return;
+      }
+      // A timeout, a rejection or a second caller completing the completer must
+      // stop the poll. Leaving it running re-entered `evaluate` on the same
+      // runtime from a timer while the caller had already moved on, which nests
+      // js_channel → Dart → evaluate until the stack is exhausted.
+      if (completer.isCompleted) {
+        stopPolling();
         return;
       }
       // call to _JS_ExecutePendingJob
@@ -164,7 +191,7 @@ extension HandlePromises on JavascriptRuntime {
 
       //  * Vue view generation using QuickJS - https://github.com/galvez/fast-vue-ssr/
       if (!isPendingPromise(idxPromise)) {
-        timer.cancel();
+        stopPolling();
         final value = evaluate(
           "JSON.stringify(FLUTTER_NATIVEJS_PENDING_PROMISES[$idxPromise].getValue())",
         );
