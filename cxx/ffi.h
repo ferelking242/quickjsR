@@ -139,6 +139,8 @@ extern "C"
 
   DLLEXPORT void jsFree(JSContext *ctx, void *ptab);
 
+  DLLEXPORT void jsFreeBuffer(JSContext *ctx, uint8_t *buf);
+
   DLLEXPORT uint8_t *CompileScript(JSContext *ctx, const char *script, const char *fileName, size_t *lengthPtr);
 
   DLLEXPORT JSValue *EvaluateBytecode(JSContext *ctx, size_t length, uint8_t *buf);

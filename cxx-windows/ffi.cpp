@@ -37,13 +37,24 @@ extern "C"
       JSChannel * channel;
       int64_t timeout;
       int64_t start;
+      // Set to 0 by jsFreeRuntime before the opaque is deleted. A JS callback
+      // (js_channel, the module loader, the promise tracker) can still be
+      // invoked after the Dart side released the runtime — e.g. a pending
+      // promise job drained during shutdown, or an interrupt fired while the
+      // context is being torn down. Dereferencing the freed opaque and jumping
+      // into the Dart callback trampoline is the `js_channel` SIGSEGV with a
+      // null fault address.
+      int alive;
   };
 
   JSModuleDef *js_module_loader(
       JSContext *ctx,
       const char *module_name, void *opaque)
   {
-    const char *str = (char *)((RuntimeOpaque *)opaque)->channel(ctx, JSChannelType_MODULE, (void *)module_name);
+    RuntimeOpaque *op = (RuntimeOpaque *)opaque;
+    if (op == nullptr || !op->alive || op->channel == nullptr)
+      return NULL;
+    const char *str = (char *)op->channel(ctx, JSChannelType_MODULE, (void *)module_name);
     if (str == 0)
       return NULL;
     JSValue func_val = JS_Eval(ctx, str, strlen(str), module_name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
@@ -57,14 +68,31 @@ extern "C"
 
   JSValue js_channel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *func_data)
   {
+    // `ctx` itself can arrive null: the crash log for this frame is
+    // `SIGSEGV / fault addr 0x0` with x0 == 0, and x0 is `ctx`. JS_GetRuntime
+    // dereferences it immediately, so the check has to come first.
+    if (ctx == nullptr)
+      return JS_UNDEFINED;
     JSRuntime *rt = JS_GetRuntime(ctx);
     RuntimeOpaque *opaque = (RuntimeOpaque *)JS_GetRuntimeOpaque(rt);
+    if (opaque == nullptr || !opaque->alive || opaque->channel == nullptr)
+      return JS_UNDEFINED;
     void *data[4];
     data[0] = &this_val;
     data[1] = &argc;
     data[2] = argv;
     data[3] = func_data;
-    return *(JSValue *)opaque->channel(ctx, JSChannelType_METHON, data);
+    JSValue *result = (JSValue *)opaque->channel(ctx, JSChannelType_METHON, data);
+    // A null result means the runtime was torn down underneath the call; the
+    // dereference below was the `fault addr 0x0` SIGSEGV.
+    if (result == nullptr)
+      return JS_UNDEFINED;
+    // `channel` returns a heap JSValue* (every jsNew*/jsDupValue allocates with
+    // `new`), but this callback returns the value by copy, so that allocation
+    // was leaked on every JS -> Dart -> JS call. Copy, then delete it.
+    JSValue out = *result;
+    delete result;
+    return out;
   }
 
   void js_promise_rejection_tracker(JSContext *ctx, JSValueConst promise,
@@ -73,11 +101,16 @@ extern "C"
   {
     if (is_handled)
       return;
-    ((RuntimeOpaque *)opaque)->channel(ctx, JSChannelType_PROMISE_TRACK, &reason);
+    RuntimeOpaque *op = (RuntimeOpaque *)opaque;
+    if (op == nullptr || !op->alive || op->channel == nullptr)
+      return;
+    op->channel(ctx, JSChannelType_PROMISE_TRACK, &reason);
   }
 
   int js_interrupt_handler(JSRuntime * rt, void * opaque) {
     RuntimeOpaque *op = (RuntimeOpaque *)opaque;
+    if (op == nullptr || !op->alive)
+      return 1; // dead runtime: stop the (already torn-down) execution
     if(op->timeout && op->start && (clock() - op->start) > op->timeout * CLOCKS_PER_SEC / 1000) {
       op->start = 0;
       return 1;
@@ -88,7 +121,7 @@ extern "C"
   DLLEXPORT JSRuntime *jsNewRuntime(JSChannel channel, int64_t timeout)
   {
     JSRuntime *rt = JS_NewRuntime();
-    RuntimeOpaque *opaque = new RuntimeOpaque({channel, timeout, 0});
+    RuntimeOpaque *opaque = new RuntimeOpaque({channel, timeout, 0, 1});
     JS_SetRuntimeOpaque(rt, opaque);
     JS_SetHostPromiseRejectionTracker(rt, js_promise_rejection_tracker, opaque);
     JS_SetModuleLoaderFunc(rt, nullptr, js_module_loader, opaque);
@@ -111,7 +144,8 @@ extern "C"
             JSClassID classid = JS_GetClassID(obj);
             void *opaque = JS_GetOpaque(obj, classid);
             RuntimeOpaque *runtimeOpaque = (RuntimeOpaque *)JS_GetRuntimeOpaque(rt);
-            if (runtimeOpaque == nullptr)
+            if (runtimeOpaque == nullptr || !runtimeOpaque->alive ||
+                runtimeOpaque->channel == nullptr)
               return;
             runtimeOpaque->channel((JSContext *)rt, JSChannelType_FREE_OBJECT, opaque);
           }};
@@ -158,7 +192,14 @@ extern "C"
   {
     RuntimeOpaque *opauqe = (RuntimeOpaque *)JS_GetRuntimeOpaque(rt);
     if (opauqe)
+    {
+      // Mark dead *before* deleting so any callback QuickJS runs while freeing
+      // the runtime (finalizers, promise jobs) sees `alive == 0` and bails out
+      // instead of calling into the Dart trampoline.
+      opauqe->alive = 0;
+      opauqe->channel = nullptr;
       delete opauqe;
+    }
     JS_SetRuntimeOpaque(rt, nullptr);
     JS_FreeRuntime(rt);
   }
@@ -433,14 +474,28 @@ extern "C"
       return NULL;
     }
 
-    return JS_WriteObject(ctx, lengthPtr, value, JS_WRITE_OBJ_BYTECODE);
+    uint8_t *buf = JS_WriteObject(ctx, lengthPtr, value, JS_WRITE_OBJ_BYTECODE);
+    // The compiled function object is only needed to produce the bytecode;
+    // never freeing it leaked one function object per extension compile.
+    JS_FreeValue(ctx, value);
+    return buf;
+  }
+
+  // Frees a buffer returned by JS_WriteObject, which comes from js_malloc and
+  // must not go through the C allocator's free().
+  DLLEXPORT void jsFreeBuffer(JSContext *ctx, uint8_t *buf)
+  {
+    js_free(ctx, buf);
   }
 
   DLLEXPORT JSValue *EvaluateBytecode(JSContext *ctx, size_t length, uint8_t *buf) {
     JSValue obj = JS_ReadObject(ctx, buf, length, JS_READ_OBJ_BYTECODE);
 
+    // Returning NULL makes the Dart caller dereference it (jsIsException
+    // reads *val), which was a SIGSEGV on corrupt or mismatched bytecode.
+    // Hand back an exception value instead so the caller can parse the error.
     if (JS_IsException(obj)) {
-      return NULL;
+      return new JSValue(obj);
     }
 
     JSValue value = JS_EvalFunction(ctx, obj);

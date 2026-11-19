@@ -252,19 +252,32 @@ class QuickJsRuntime2 extends JavascriptRuntime {
   }
 
   Uint8List compile(String script, String fileName) {
+    // `close()`/`dispose()` null the context. Without this guard a late
+    // compile hit the `_ctx!` null check instead of a clear JSError.
+    _ensureEngine();
     final ctx = _ctx!;
     final scriptPtr = script.toNativeUtf8().cast<Char>();
     final fileNamePtr = fileName.toNativeUtf8().cast<Char>();
     final lengthPtr = calloc<IntPtr>();
     final value = compileFn(ctx, scriptPtr, fileNamePtr, lengthPtr);
     final length = lengthPtr.value;
-    final data = Uint8List.fromList(value.asTypedList(length));
 
     calloc.free(scriptPtr);
     calloc.free(fileNamePtr);
     calloc.free(lengthPtr);
-    calloc.free(value);
 
+    // CompileScript returns NULL when the script does not compile. Building a
+    // typed list from a null pointer is a native crash, so surface it as an
+    // empty result and let the caller fall back to source evaluation.
+    if (value.address == 0 || length <= 0) {
+      if (value.address != 0) jsFreeBuffer(ctx, value);
+      return Uint8List(0);
+    }
+
+    final data = Uint8List.fromList(value.asTypedList(length));
+    // JS_WriteObject allocates through js_malloc; the C allocator's free()
+    // would corrupt the heap.
+    jsFreeBuffer(ctx, value);
     return data;
   }
 

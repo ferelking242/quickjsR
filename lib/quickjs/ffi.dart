@@ -576,6 +576,9 @@ void jsFreeValue(
   Pointer<JSValue> val, {
   bool free = true,
 }) {
+  // jsFreeValue dereferences val, so a null pointer (a failed native call)
+  // would crash here instead of surfacing as a Dart error.
+  if (val.address == 0) return;
   _jsFreeValue(ctx, val, free ? 1 : 0);
 }
 
@@ -1011,13 +1014,18 @@ Pointer<JSValue> jsCall(
 /// int jsIsException(JSValueConst *val)
 final int Function(
   Pointer<JSValue> val,
-) jsIsException = _qjsLib
+) _jsIsException = _qjsLib
     .lookup<
         NativeFunction<
             Int32 Function(
               Pointer<JSValue>,
             )>>('jsIsException')
     .asFunction();
+
+/// Null-safe wrapper: the native function dereferences `val` immediately, so
+/// passing a null pointer (e.g. a failed EvaluateBytecode) was a SIGSEGV.
+int jsIsException(Pointer<JSValue> val) =>
+    val.address == 0 ? 1 : _jsIsException(val);
 
 /// JSValue *jsGetException(JSContext *ctx)
 final Pointer<JSValue> Function(
@@ -1052,6 +1060,20 @@ final Pointer<JSValue> Function(
               Pointer<JSContext>,
               Pointer<JSValue>,
             )>>('jsNewPromiseCapability')
+    .asFunction();
+
+/// void jsFreeBuffer(JSContext *ctx, uint8_t *buf)
+/// Frees a buffer from JS_WriteObject (js_malloc), not the C allocator.
+final void Function(
+  Pointer<JSContext> ctx,
+  Pointer<Uint8> buf,
+) jsFreeBuffer = _qjsLib
+    .lookup<
+        NativeFunction<
+            Void Function(
+              Pointer<JSContext>,
+              Pointer<Uint8>,
+            )>>('jsFreeBuffer')
     .asFunction();
 
 /// void jsFree(JSContext *ctx, void *ptab)

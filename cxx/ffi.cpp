@@ -90,7 +90,14 @@ extern "C"
     // The Dart handler can return a null pointer when the runtime was torn
     // down underneath the call (or when the handler failed). Dereferencing it
     // was the `fault addr 0x0` SIGSEGV; hand back undefined instead.
-    return result ? *result : JS_UNDEFINED;
+    if (result == nullptr)
+      return JS_UNDEFINED;
+    // `channel` returns a heap JSValue* (every jsNew*/jsDupValue allocates with
+    // `new`), but this callback returns the value by copy, so that allocation
+    // was leaked on every JS -> Dart -> JS call. Copy, then delete it.
+    JSValue out = *result;
+    delete result;
+    return out;
   }
 
   void js_promise_rejection_tracker(JSContext *ctx, JSValueConst promise,
@@ -472,19 +479,33 @@ extern "C"
       return NULL;
     }
 
-    return JS_WriteObject(ctx, lengthPtr, value, JS_WRITE_OBJ_BYTECODE);
+    uint8_t *buf = JS_WriteObject(ctx, lengthPtr, value, JS_WRITE_OBJ_BYTECODE);
+    // The compiled function object is only needed to produce the bytecode;
+    // never freeing it leaked one function object per extension compile.
+    JS_FreeValue(ctx, value);
+    return buf;
   }
 
   DLLEXPORT JSValue *EvaluateBytecode(JSContext *ctx, size_t length, uint8_t *buf) {
     JSValue obj = JS_ReadObject(ctx, buf, length, JS_READ_OBJ_BYTECODE);
 
+    // Returning NULL makes the Dart caller dereference it (jsIsException
+    // reads *val), which was a SIGSEGV on corrupt or mismatched bytecode.
+    // Hand back an exception value instead so the caller can parse the error.
     if (JS_IsException(obj)) {
-      return NULL;
+      return new JSValue(obj);
     }
 
     JSValue value = JS_EvalFunction(ctx, obj);
 
     return new JSValue(value);
+  }
+
+  // Frees a buffer returned by JS_WriteObject, which comes from js_malloc and
+  // must not go through the C allocator's free().
+  DLLEXPORT void jsFreeBuffer(JSContext *ctx, uint8_t *buf)
+  {
+    js_free(ctx, buf);
   }
 
 }
