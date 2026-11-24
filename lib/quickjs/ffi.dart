@@ -162,10 +162,25 @@ final Pointer<JSRuntime> Function(
 
 class _RuntimeOpaque {
   final _JSChannel _channel;
+
+  /// The `Pointer.fromFunction` trampoline handed to `jsNewRuntime`.
+  ///
+  /// QuickJS stores this pointer in its `RuntimeOpaque` and calls it on every
+  /// JS -> Dart channel call (promise jobs, class finalizers, the module
+  /// loader). The pointer used to be a temporary created inline in
+  /// [jsNewRuntime], so nothing in Dart referenced the trampoline once that
+  /// call returned: the FFI callback metadata could be released while the
+  /// native side still held the address. A later call then jumped into a
+  /// recycled `FfiCallbackMetadata::TrampolinePage` entry, which is the
+  /// `SIGBUS / BUS_ADRALN` at an odd, anonymous `pc` seen on Android. Holding
+  /// the pointer for the runtime's lifetime keeps the trampoline alive until
+  /// [jsFreeRuntime] drops this opaque.
+  final Pointer<NativeFunction<_JSChannelNative>> nativeChannel;
+
   List<JSRef> _ref = [];
   final ReceivePort _port;
   int? _dartObjectClassId;
-  _RuntimeOpaque(this._channel, this._port);
+  _RuntimeOpaque(this._channel, this._port, this.nativeChannel);
 
   int? get dartObjectClassId => _dartObjectClassId;
 
@@ -227,8 +242,13 @@ Pointer<JSRuntime> jsNewRuntime(
   int timeout,
   ReceivePort port,
 ) {
-  final rt = _jsNewRuntime(Pointer.fromFunction(channelDispacher), timeout);
-  runtimeOpaques[rt] = _RuntimeOpaque(callback, port);
+  final nativeChannel = Pointer.fromFunction<_JSChannelNative>(channelDispacher);
+  final rt = _jsNewRuntime(nativeChannel, timeout);
+  // `nativeChannel` must outlive the runtime: QuickJS calls it for every
+  // JS -> Dart hop, so releasing the trampoline frees the callback under the
+  // engine. It is owned by the opaque, which jsFreeRuntime removes once the
+  // native runtime is gone.
+  runtimeOpaques[rt] = _RuntimeOpaque(callback, port, nativeChannel);
   return rt;
 }
 
