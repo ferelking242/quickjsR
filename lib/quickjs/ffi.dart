@@ -307,20 +307,16 @@ void jsFreeRuntime(
   final referenceleak = <String>[];
   final opaque = runtimeOpaques[rt];
   if (opaque != null) {
-    while (true) {
-      final ref = opaque._ref.firstWhereOrNull((ref) => ref is JSRefLeakable);
-      if (ref == null) break;
-      ref.destroy();
-      runtimeOpaques[rt]?._ref.remove(ref);
-    }
-    while (opaque._ref.isNotEmpty) {
-      final ref = opaque._ref.first;
-      final objStrs = ref.toString().split('\n');
-      final objStr = objStrs.length > 0 ? objStrs[0] + " ..." : objStrs[0];
+    // Refs are released by [jsReleaseRuntimeRefs] *before* the context is
+    // freed, so anything still listed here outlived its engine. Destroying it
+    // now would run jsFreeValue through a freed JSContext — a native free on
+    // torn-down heap, the "corrupted chunk header" abort Scudo reports. Report
+    // the survivors from Dart state only and drop them.
+    for (final ref in List<JSRef>.from(opaque._ref)) {
       referenceleak.add(
-          "  ${identityHashCode(ref)}\t${ref._refCount + 1}\t${ref.runtimeType.toString()}\t$objStr");
-      ref.destroy();
+          "  ${identityHashCode(ref)}\t${ref._refCount + 1}\t${ref.runtimeType.toString()}");
     }
+    opaque._ref.clear();
   }
   try {
     _jsFreeRuntime(rt);
