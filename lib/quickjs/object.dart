@@ -74,6 +74,7 @@ class _DartObject extends JSRef implements JSRefLeakable {
     _ctx = null;
     _obj = null;
     if (ctx == null) return;
+    if (!_isLiveContext(ctx)) return;
     runtimeOpaques[jsGetRuntime(ctx)]?.removeRef(this);
     if (obj is JSRef) obj.free();
   }
@@ -134,6 +135,9 @@ class _JSObject extends JSRef {
     _val = null;
     _ctx = null;
     if (ctx == null || val == null) return;
+    // The runtime may already be gone (worker recycled, source disposed): the
+    // pointer is stale and jsGetRuntime/jsFreeValue would fault in native code.
+    if (!_isLiveContext(ctx)) return;
     final rt = jsGetRuntime(ctx);
     runtimeOpaques[rt]?.removeRef(this);
     jsFreeValue(ctx, val);
@@ -169,6 +173,13 @@ class _JSFunction extends _JSObject implements JSInvokable, _IsolateEncodable {
     final val = _val;
     if (ctx == null || val == null)
       throw JSError("InternalError: JSValue released");
+    // A function reference can outlive its runtime (a promise continuation
+    // kept by a closed worker, a setTimeout handler after dispose). Calling
+    // jsCall on a freed context is a native crash, not a Dart exception.
+    if (!_isLiveContext(ctx))
+      throw JSError(
+        "InternalError: JavaScript runtime was released before this call",
+      );
     final args = arguments
         .map(
           (e) => _dartToJs(ctx, e),

@@ -24,6 +24,20 @@ typedef _JsModuleHandler = String Function(String name);
 /// Handler to manage unhandled promise rejection.
 typedef _JsHostPromiseRejectionHandler = void Function(dynamic reason);
 
+/// Addresses of the JS contexts whose native engine is still allocated.
+///
+/// `_JSFunction`/`_JSObject` keep their own copy of the context pointer, so a
+/// callback that outlives the runtime (a promise continuation, a `setTimeout`
+/// handler, a channel reply completing after the worker was recycled) still
+/// holds a valid-looking pointer into memory `jsFreeContext` already returned
+/// to the allocator. Calling into it is the `js_channel` SIGSEGV with
+/// `fault addr 0x0`. Every native call made from a stored reference checks this
+/// set first and fails as a normal [JSError] instead.
+final Set<int> _liveContexts = <int>{};
+
+bool _isLiveContext(Pointer<JSContext>? ctx) =>
+    ctx != null && _liveContexts.contains(ctx.address);
+
 /// Quickjs engine for flutter.
 class QuickJsRuntime2 extends JavascriptRuntime {
   Pointer<JSRuntime>? _rt;
@@ -35,6 +49,20 @@ class QuickJsRuntime2 extends JavascriptRuntime {
   /// left the old JSRefs and channel callbacks pointing at freed memory, which
   /// is the SIGSEGV seen in `js_channel`.
   bool _disposed = false;
+
+  /// True while a JS -> Dart channel callback (http_get, preferences.get, a
+  /// setTimeout handler, …) is running on this runtime.
+  ///
+  /// QuickJS is not reentrant. A handler that synchronously evaluates JS —
+  /// reading a preference whose default seeding boots a nested extension call
+  /// is the real case on MissAV playback — puts a second `JS_Eval` on top of
+  /// the frame that is still executing, which corrupts the interpreter state
+  /// and ends in `js_channel` SIGSEGV (fault addr 0x0). The native layer
+  /// rejects the nested call too; this flag lets Dart fail with a normal
+  /// [JSError] before crossing FFI.
+  int _channelDepth = 0;
+
+  bool get isInChannelCallback => _channelDepth > 0;
 
   /// Max stack size for quickjs.
   int stackSize;
@@ -74,6 +102,10 @@ class QuickJsRuntime2 extends JavascriptRuntime {
       throw JSError('InternalError: JavaScript runtime has been disposed');
     }
     final rt = jsNewRuntime((ctx, type, ptr) {
+      // Every JS -> Dart callback runs inside QuickJS's own stack frame. Mark
+      // the window so a handler that would evaluate JS fails with a JSError
+      // instead of re-entering the interpreter (SIGSEGV in js_channel).
+      _channelDepth++;
       try {
         switch (type) {
           case JSChannelType.METHON:
@@ -138,6 +170,8 @@ class QuickJsRuntime2 extends JavascriptRuntime {
           return nullptr;
         }
         return err;
+      } finally {
+        _channelDepth--;
       }
     }, timeout ?? 0, port);
     final stackSize = this.stackSize;
@@ -148,6 +182,7 @@ class QuickJsRuntime2 extends JavascriptRuntime {
     if (gcThreshold > 0) jsSetGCThreshold(rt, gcThreshold);
     _rt = rt;
     _ctx = jsNewContext(rt);
+    _liveContexts.add(_ctx!.address);
   }
 
   /// Free Runtime and Context which can recreate when evaluate again.
@@ -164,7 +199,13 @@ class QuickJsRuntime2 extends JavascriptRuntime {
     // still-live context. Doing it after jsFreeContext freed the context first
     // and turned teardown into a use-after-free.
     jsReleaseRuntimeRefs(rt);
-    if (ctx != null) jsFreeContext(ctx);
+    if (ctx != null) {
+      // Mark dead *before* the native free: a JSRef released during teardown,
+      // or a callback that races the close, must see the context as gone and
+      // refuse the call instead of writing into freed memory.
+      _liveContexts.remove(ctx.address);
+      jsFreeContext(ctx);
+    }
     try {
       jsFreeRuntime(rt);
     } on String catch (e) {
@@ -211,6 +252,17 @@ class QuickJsRuntime2 extends JavascriptRuntime {
     int? evalFlags,
     String? sourceUrl,
   }) {
+    // Nested evaluation from a channel handler is rejected instead of running
+    // a second JS_Eval on the frame that is still executing (SIGSEGV in
+    // js_channel). The native layer enforces the same rule; checking here
+    // turns it into a catchable JSError the extension can see.
+    if (isInChannelCallback) {
+      final exception = JSError(
+        'InternalError: QuickJS is not reentrant — evaluate() called from a '
+        'channel callback (${name ?? '<eval>'})',
+      );
+      return JsEvalResult(exception.toString(), exception, isError: true);
+    }
     _ensureEngine();
     final ctx = _ctx!;
     final jsval = jsEval(
@@ -231,6 +283,13 @@ class QuickJsRuntime2 extends JavascriptRuntime {
   }
 
   JsEvalResult evaluateBytecode(Uint8List bytecode) {
+    if (isInChannelCallback) {
+      final exception = JSError(
+        'InternalError: QuickJS is not reentrant — bytecode evaluation from a '
+        'channel callback',
+      );
+      return JsEvalResult(exception.toString(), exception, isError: true);
+    }
     _ensureEngine();
     final ctx = _ctx!;
     final Pointer<Uint8> pointer = calloc<Uint8>(bytecode.length);
@@ -254,6 +313,12 @@ class QuickJsRuntime2 extends JavascriptRuntime {
   Uint8List compile(String script, String fileName) {
     // `close()`/`dispose()` null the context. Without this guard a late
     // compile hit the `_ctx!` null check instead of a clear JSError.
+    if (isInChannelCallback) {
+      throw JSError(
+        'InternalError: QuickJS is not reentrant — compile() called from a '
+        'channel callback',
+      );
+    }
     _ensureEngine();
     final ctx = _ctx!;
     final scriptPtr = script.toNativeUtf8().cast<Char>();

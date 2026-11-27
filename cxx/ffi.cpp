@@ -37,6 +37,13 @@ extern "C"
       JSChannel * channel;
       int64_t timeout;
       int64_t start;
+      // Number of JS -> Dart channel callbacks currently on the native stack.
+      // QuickJS is not reentrant: a channel handler that synchronously calls
+      // back into jsEval/jsCall (a preference lookup that seeds defaults, a
+      // nested extension call) rewrites rt->current_exception and the running
+      // JS frame while JS_Eval is still on the stack. That is the
+      // `js_channel+100` SIGSEGV with fault addr 0x0 seen on MissAV playback.
+      int in_channel;
       // Set to 0 by jsFreeRuntime before the opaque is deleted. A JS callback
       // (js_channel, the module loader, the promise tracker) can still be
       // invoked after the Dart side released the runtime — e.g. a pending
@@ -81,12 +88,21 @@ extern "C"
     // `js_channel` SIGSEGV when a JS call outlives its Dart runtime.
     if (opaque == nullptr || !opaque->alive || opaque->channel == nullptr)
       return JS_UNDEFINED;
+    // QuickJS is not reentrant. A Dart channel handler that synchronously
+    // evaluates or calls JS (a preference read that seeds defaults, a nested
+    // extension call) would run a second JS_Eval on top of the frame that is
+    // still executing, corrupting rt->current_exception and the JS stack —
+    // the `js_channel` SIGSEGV with fault addr 0x0. Nested entry is rejected
+    // at the FFI boundary instead (see jsEval/jsCall), so this counter only
+    // has to make the window visible to them.
+    opaque->in_channel++;
     void *data[4];
     data[0] = &this_val;
     data[1] = &argc;
     data[2] = argv;
     data[3] = func_data;
     JSValue *result = (JSValue *)opaque->channel(ctx, JSChannelType_METHON, data);
+    opaque->in_channel--;
     // The Dart handler can return a null pointer when the runtime was torn
     // down underneath the call (or when the handler failed). Dereferencing it
     // was the `fault addr 0x0` SIGSEGV; hand back undefined instead.
@@ -126,7 +142,15 @@ extern "C"
   DLLEXPORT JSRuntime *jsNewRuntime(JSChannel channel, int64_t timeout)
   {
     JSRuntime *rt = JS_NewRuntime();
-    RuntimeOpaque *opaque = new RuntimeOpaque({channel, timeout, 0, 1});
+    // Assigned field by field: a positional aggregate silently shifts every
+    // later member when one is inserted, which would leave `alive` at 0 and
+    // make the runtime look dead to every guard.
+    RuntimeOpaque *opaque = new RuntimeOpaque();
+    opaque->channel = channel;
+    opaque->timeout = timeout;
+    opaque->start = 0;
+    opaque->in_channel = 0;
+    opaque->alive = 1;
     JS_SetRuntimeOpaque(rt, opaque);
     JS_SetHostPromiseRejectionTracker(rt, js_promise_rejection_tracker, opaque);
     JS_SetModuleLoaderFunc(rt, nullptr, js_module_loader, opaque);
@@ -240,6 +264,18 @@ extern "C"
   DLLEXPORT JSValue *jsEval(JSContext *ctx, const char *input, size_t input_len, const char *filename, int32_t eval_flags)
   {
     JSRuntime *rt = JS_GetRuntime(ctx);
+    // Reject a nested evaluation instead of letting JS_Eval run on top of the
+    // frame that is still executing. A Dart channel handler (http_get,
+    // preferences.get, …) that evaluates JS re-enters QuickJS, which is not
+    // reentrant: the crash log shows jsEval ← js_channel ← JS_Eval on the same
+    // stack. Returning an exception keeps the process alive and surfaces a
+    // normal JS error to the extension.
+    RuntimeOpaque *opaque = (RuntimeOpaque *)JS_GetRuntimeOpaque(rt);
+    if (opaque != nullptr && opaque->in_channel > 0)
+    {
+      JS_ThrowInternalError(ctx, "QuickJS is not reentrant: nested jsEval rejected");
+      return new JSValue(JS_EXCEPTION);
+    }
     js_begin_call(rt);
     JSValue *ret = new JSValue(JS_Eval(ctx, input, input_len, filename, eval_flags));
     return ret;
@@ -438,6 +474,14 @@ extern "C"
                             int32_t argc, JSValueConst *argv)
   {
     JSRuntime *rt = JS_GetRuntime(ctx);
+    // Same non-reentrancy guard as jsEval: calling a JS function from inside a
+    // channel handler runs it on top of the frame that is still executing.
+    RuntimeOpaque *opaque = (RuntimeOpaque *)JS_GetRuntimeOpaque(rt);
+    if (opaque != nullptr && opaque->in_channel > 0)
+    {
+      JS_ThrowInternalError(ctx, "QuickJS is not reentrant: nested jsCall rejected");
+      return new JSValue(JS_EXCEPTION);
+    }
     js_begin_call(rt);
     JSValue *ret = new JSValue(JS_Call(ctx, *func_obj, *this_obj, argc, argv));
     return ret;
@@ -455,6 +499,12 @@ extern "C"
 
   DLLEXPORT int32_t jsExecutePendingJob(JSRuntime *rt)
   {
+    // Draining jobs from inside a channel handler would run JS on top of the
+    // frame that is still executing. Report "no job" so the caller's drain
+    // loop stops; the regular poller picks the jobs up on its next tick.
+    RuntimeOpaque *opaque = (RuntimeOpaque *)JS_GetRuntimeOpaque(rt);
+    if (opaque != nullptr && opaque->in_channel > 0)
+      return 0;
     js_begin_call(rt);
     JSContext *ctx;
     int ret = JS_ExecutePendingJob(rt, &ctx);
